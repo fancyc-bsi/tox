@@ -102,11 +102,6 @@ class BinaryAnalyzer(SecurityAnalyzer):
                 r'(?:wlan|eth)[0-9]+',
                 r'(?:tcp|udp|icmp)'
             ],
-            # 'crypto': [
-            #     r'(?:md5|sha1|des|aes|blowfish)',
-            #     r'(?:encrypt|decrypt)',
-            #     r'(?:public|private)key'
-            # ],
             'shell': [
                 r'system\(',
                 r'exec\(',
@@ -202,26 +197,6 @@ class BinaryAnalyzer(SecurityAnalyzer):
                                               capture_output=True, 
                                               text=True).stdout
                 
-                # Check for no-exec stack
-                # if "GNU_STACK" in readelf_output and "RWE" in readelf_output:
-                #     self.add_finding(Finding(
-                #         severity=FindingSeverity.HIGH,
-                #         finding_type="executable_stack",
-                #         path=str(path),
-                #         details="Binary has executable stack enabled",
-                #         evidence="GNU_STACK segment is marked as executable"
-                #     ))
-
-                # Check for no RELRO
-                # if "GNU_RELRO" not in readelf_output:
-                #     self.add_finding(Finding(
-                #         severity=FindingSeverity.MEDIUM,
-                #         finding_type="no_relro",
-                #         path=str(path),
-                #         details="Binary compiled without RELRO protection",
-                #         evidence="GNU_RELRO segment not found"
-                #     ))
-
             except subprocess.SubprocessError:
                 pass  # readelf not available
 
@@ -398,11 +373,27 @@ class ConfigAnalyzer(SecurityAnalyzer):
             'env': r'.*\.env$',
             'json_config': r'.*config.*\.json$',
             'yaml_config': r'.*config.*\.ya?ml$',
+            'xml_config': r'.*\.xml$',  # Basic XML pattern
             'docker': r'Dockerfile|docker-compose\.ya?ml',
             'systemd': r'.*/systemd/.*\.service$',
             'nginx': r'.*nginx.*\.conf$',
             'apache': r'.*apache2?.*\.conf$'
         }
+
+        # Add specific paths for common IoT config locations
+        self.COMMON_CONFIG_PATHS = {
+            'device_config': r'.*/var/config/.*\.xml$',
+            'system_config': r'.*/etc/.*\.xml$',
+            'app_config': r'.*/usr/share/.*\.xml$',
+            'web_config': r'.*/var/www/.*\.xml$',
+            'dbus_config': r'.*/usr/share/xml/dbus-.*\.xml$',
+            'network_config': r'.*/var/config/network/.*\.xml$',
+            'wireless_config': r'.*/var/config/wireless/.*\.xml$',
+            'app_data': r'.*/var/lib/.*/.*\.xml$',
+        }
+
+        # Merge both pattern dictionaries
+        self.CONFIG_PATTERNS.update(self.COMMON_CONFIG_PATHS)
 
         self.SECURITY_PATTERNS = {
             'debug_mode': (
@@ -439,13 +430,60 @@ class ConfigAnalyzer(SecurityAnalyzer):
                 r'telnet[d]?\s+start|enable\s+telnet',
                 FindingSeverity.CRITICAL,
                 "Telnet service enabled"
+            ),
+            'psk_key': (
+                r'(?i)(?:psk|pre[-_]shared[-_]key)\s*[=:]\s*[\'"][^\'"\s]{8,}[\'"]',
+                FindingSeverity.HIGH,
+                "Pre-shared key found"
+            ),
+            'wifi_psk': (
+                r'(?i)(?:wpa[-_]psk|wifi[-_]psk|wireless[-_]key)\s*[=:]\s*[\'"][^\'"\s]{8,}[\'"]',
+                FindingSeverity.HIGH,
+                "WiFi pre-shared key found"
             )
         }
+
+    def _should_analyze_file(self, path: Path) -> bool:
+        """Determine if a file should be analyzed based on its path and type"""
+        try:
+            str_path = str(path)
+            # Skip ALL shared library files
+            if any(part.startswith('libxml') for part in path.parts):
+                return False
+                
+            # Skip any .so files in lib directories
+            if 'lib' in path.parts and any(part.endswith('.so') or '.so.' in part for part in path.parts):
+                return False
+                
+            # Skip catalog files and other known non-config XMLs
+            if any(x in path.name.lower() for x in ['catalog', 'schema', 'template']):
+                return False
+
+            # Explicitly look for config.xml in any directory
+            if path.name == 'config.xml':
+                return True
+
+            # Check against our patterns
+            for pattern in self.CONFIG_PATTERNS.values():
+                if re.match(pattern, str_path):
+                    # Debug when pattern matches
+                    # print(f"Pattern match: {pattern} -> {str_path}")
+                    return True
+
+            return False
+
+        except Exception as e:
+            logging.debug(f"Error checking file {path}: {str(e)}")
+            return False
 
     def analyze(self) -> None:
         """Analyze configuration files using parallel processing"""
         with ThreadPoolExecutor() as executor:
-            list(executor.map(self._analyze_file, self.get_files_to_analyze()))
+            files_to_analyze = [
+                path for path in self.get_files_to_analyze()
+                if self._should_analyze_file(path)
+            ]
+            list(executor.map(self._analyze_file, files_to_analyze))
 
     def _analyze_file(self, path: Path) -> None:
         """Analyze a single configuration file"""
@@ -465,13 +503,109 @@ class ConfigAnalyzer(SecurityAnalyzer):
                     content = f.read()
                     
                     # Parse and analyze structured configs
-                    if path.suffix in {'.json', '.yaml', '.yml'}:
+                    if path.suffix == '.xml':
+                        self._analyze_xml_config(path, content)
+                    elif path.suffix in {'.json', '.yaml', '.yml'}:
                         self._analyze_structured_config(path, content, config_type)
                     else:
                         self._analyze_text_config(path, content, config_type)
 
         except Exception as e:
             logging.debug(f"Error analyzing config file {path}: {str(e)}")
+
+    def _analyze_xml_config(self, path: Path, content: str) -> None:
+        """Analyze XML configuration files"""
+        try:
+            # Add INFO finding for config.xml files
+            if path.name == 'config.xml':
+                self.add_finding(Finding(
+                    severity=FindingSeverity.INFO,
+                    finding_type="xml_config_file",
+                    path=str(path),
+                    details="Configuration file found",
+                    evidence=f"Config file at: {str(path)}"
+                ))
+
+            # Rest of existing XML patterns
+            xml_patterns = {
+                'xml_psk': (
+                    r'<(?:key|psk|password)[^>]*>([^<]+)</(?:key|psk|password)>',
+                    FindingSeverity.HIGH,
+                    "Pre-shared key or password in XML"
+                ),
+                'xml_wifi_config': (
+                    r'<(?:wireless|wifi|wlan)[^>]*>.*?</(?:wireless|wifi|wlan)>',
+                    FindingSeverity.MEDIUM,
+                    "Wireless configuration found"
+                ),
+                'xml_debug': (
+                    r'<debug[^>]*>(?:true|1|yes|on)</debug>',
+                    FindingSeverity.MEDIUM,
+                    "Debug mode enabled in XML config"
+                ),
+                'xml_credentials': (
+                    r'<(?:credentials|authentication)[^>]*>.*?</(?:credentials|authentication)>',
+                    FindingSeverity.HIGH,
+                    "Credential configuration found"
+                )
+            }
+
+            # Check for XML-specific patterns
+            for pattern_name, (pattern, severity, description) in xml_patterns.items():
+                matches = re.finditer(pattern, content, re.IGNORECASE | re.DOTALL)
+                for match in matches:
+                    # Skip if it looks like a template or example
+                    if any(template in match.group(0).lower() for template in 
+                          ['${', '{$', '<%', '%>', 'example', 'template']):
+                        continue
+
+                    self.add_finding(Finding(
+                        severity=severity,
+                        finding_type=f"xml_{pattern_name}",
+                        path=str(path),
+                        details=description,
+                        evidence=match.group(0)[:200]  # Limit evidence length
+                    ))
+
+            # Check network-specific configurations
+            self._check_network_config(path, content)
+
+            # Also check for regular security patterns in XML content
+            self._analyze_text_config(path, content, 'xml')
+
+        except Exception as e:
+            logging.debug(f"Error analyzing XML config {path}: {str(e)}")
+
+    def _check_network_config(self, path: Path, content: str) -> None:
+        """Check network-related configurations"""
+        network_patterns = {
+            'weak_wifi': (
+                r'(?i)(?:encryption|security)[^>]*>(?:none|wep)</(?:encryption|security)>',
+                FindingSeverity.CRITICAL,
+                "Weak or no WiFi encryption"
+            ),
+            'open_wifi': (
+                r'(?i)(?:authentication|auth-mode)[^>]*>open</(?:authentication|auth-mode)>',
+                FindingSeverity.HIGH,
+                "Open WiFi authentication"
+            ),
+            'hidden_psk': (
+                r'(?i)(?<!example)(?<!template)(?:psk|key)[^>]*>[^<]{8,}</(?:psk|key)>',
+                FindingSeverity.HIGH,
+                "Hidden pre-shared key found"
+            )
+        }
+
+        for pattern_name, (pattern, severity, description) in network_patterns.items():
+            matches = re.finditer(pattern, content, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                self.add_finding(Finding(
+                    severity=severity,
+                    finding_type=f"network_{pattern_name}",
+                    path=str(path),
+                    details=description,
+                    evidence=match.group(0)
+                ))
 
     def _analyze_structured_config(self, path: Path, content: str, config_type: str) -> None:
         """Analyze structured configuration files with improved checks"""
